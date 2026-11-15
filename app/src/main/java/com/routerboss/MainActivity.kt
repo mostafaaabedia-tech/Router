@@ -1,0 +1,177 @@
+package com.routerboss
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.Bundle
+import android.webkit.HttpAuthHandler
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.net.InetAddress
+import java.net.SocketTimeoutException
+
+/* ============ helpers ============ */
+fun ipOf(i: Int) = "${i and 255}.${i shr 8 and 255}.${i shr 16 and 255}.${i shr 24 and 255}"
+
+@Suppress("DEPRECATION")
+fun gateway(ctx: Context): String? = try {
+    val g = (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo.gateway
+    if (g == 0) null else ipOf(g)
+} catch (e: Exception) { null }
+
+@Suppress("DEPRECATION")
+fun myIp(ctx: Context): String = try {
+    ipOf((ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo.ipAddress)
+} catch (e: Exception) { "" }
+
+fun fmt(k: Double) = if (k >= 1000) "%.1f".format(k / 1000) else "%.0f".format(k)
+fun unit(k: Double) = if (k >= 1000) "Mbps" else "kbps"
+fun wrap(n: Long, p: Long) = if (n >= p) n - p else n + 4294967296L - p
+
+class Cfg(ctx: Context) {
+    private val p = ctx.getSharedPreferences("rb", Context.MODE_PRIVATE)
+    var ip by mutableStateOf(p.getString("ip", "192.168.1.1")!!)
+    var user by mutableStateOf(p.getString("user", "admin")!!)
+    var pass by mutableStateOf(p.getString("pass", "admin")!!)
+    var comm by mutableStateOf(p.getString("comm", "public")!!)
+    var ifx by mutableStateOf(p.getString("ifx", "1")!!)
+    var planDn by mutableStateOf(p.getString("pd", "8")!!)
+    var planUp by mutableStateOf(p.getString("pu", "1")!!)
+    var setupDone by mutableStateOf(p.getBoolean("done", false))
+    var online by mutableIntStateOf(-1)
+    init { if (!p.contains("ip")) gateway(ctx)?.let { ip = it } }
+    fun save() {
+        p.edit().putString("ip", ip).putString("user", user).putString("pass", pass).putString("comm", comm)
+            .putString("ifx", ifx).putString("pd", planDn).putString("pu", planUp).putBoolean("done", setupDone).apply()
+    }
+    fun name(ip: String): String = p.getString("n_$ip", "") ?: ""
+    fun setName(ip: String, n: String) { p.edit().putString("n_$ip", n).apply() }
+}
+
+/* ============ live monitor (keeps running on every tab) ============ */
+class Mon {
+    var down by mutableStateOf(0.0)
+    var up by mutableStateOf(0.0)
+    var totD by mutableStateOf(0L)
+    var totU by mutableStateOf(0L)
+    var err by mutableStateOf<String?>(null)
+    var ok by mutableStateOf(false)
+    val dh = mutableStateListOf<Float>()
+    val uh = mutableStateListOf<Float>()
+
+    suspend fun run(c: Cfg) {
+        var lt = 0L; var pi = 0L; var po = 0L
+        while (true) {
+            try {
+                val x = c.ifx.trim().ifEmpty { "1" }
+                val kI = "1.3.6.1.2.1.2.2.1.10.$x"
+                val kO = "1.3.6.1.2.1.2.2.1.16.$x"
+                val r = withContext(Dispatchers.IO) { Snmp.get(c.ip, c.comm, listOf(kI, kO)) }
+                val now = System.currentTimeMillis()
+                val i = r[kI]; val o = r[kO]
+                if (i == null || o == null || i.missing || o.missing) {
+                    ok = false; down = 0.0; up = 0.0
+                    err = "This connection has no traffic counters. Pick another one in Setup."
+                } else {
+                    val li = i.long(); val lo = o.long()
+                    if (lt > 0) {
+                        val dt = (now - lt) / 1000.0
+                        val di = wrap(li, pi); val dOut = wrap(lo, po)
+                        down = di * 8 / 1000 / dt; up = dOut * 8 / 1000 / dt
+                        totD += di; totU += dOut
+                        dh.add(down.toFloat()); uh.add(up.toFloat())
+                        if (dh.size > 60) { dh.removeAt(0); uh.removeAt(0) }
+                    }
+                    lt = now; pi = li; po = lo; ok = true; err = null
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ok = false; down = 0.0; up = 0.0
+                err = if (e is SocketTimeoutException) "Your router isn’t sharing live speed yet. Open Setup to turn it on."
+                else "Can’t read the router right now. Are you on its wifi?"
+            }
+            delay(2000)
+        }
+    }
+}
+
+/* ============ activity + theme ============ */
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val cfg = Cfg(this)
+        setContent {
+            val light = lightColorScheme(
+                primary = Color(0xFF0B8F84), onPrimary = Color.White, tertiary = Color(0xFFE5622A),
+                background = Color(0xFFF1F6F7), surface = Color.White, surfaceVariant = Color(0xFFE2ECEE),
+                onSurface = Color(0xFF0F1E22), onSurfaceVariant = Color(0xFF5A7076), outlineVariant = Color(0xFFD5E2E5),
+                error = Color(0xFFD9383E)
+            )
+            val dark = darkColorScheme(
+                primary = Color(0xFF2FD3C3), onPrimary = Color(0xFF00201D), tertiary = Color(0xFFFF9560),
+                background = Color(0xFF0A1316), surface = Color(0xFF132227), surfaceVariant = Color(0xFF1E343A),
+                onSurface = Color(0xFFE8F3F4), onSurfaceVariant = Color(0xFF93AAB0), outlineVariant = Color(0xFF263E45),
+                error = Color(0xFFFF6B70)
+            )
+            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) dark else light) {
+                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { App(cfg) }
+            }
+        }
+    }
+}
+
+@Composable
+fun App(c: Cfg) {
+    var tab by remember { mutableIntStateOf(if (c.setupDone) 0 else 4) }
+    val m = remember { Mon() }
+    LaunchedEffect(c.ip, c.comm, c.ifx) { m.run(c) }
+    val tabs = listOf("🏠" to "Home", "📱" to "Devices", "🚦" to "Priority", "🌐" to "Router", "🔧" to "Setup")
+    Scaffold(containerColor = MaterialTheme.colorScheme.background, bottomBar = {
+        NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+            tabs.forEachIndexed { i, t ->
+                NavigationBarItem(selected = tab == i, onClick = { tab = i },
+                    icon = { Text(t.first, fontSize = 20.sp) }, label = { Text(t.second, fontSize = 11.sp) })
+            }
+        }
+    }) { pad ->
+        Box(Modifier.padding(pad).fillMaxSize()) {
+            when (tab) {
+                
