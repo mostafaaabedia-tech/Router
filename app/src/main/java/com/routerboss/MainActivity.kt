@@ -3,7 +3,6 @@ package com.routerboss
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
@@ -11,9 +10,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.*
 
-/* ============ activity + theme ============ */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,7 +40,7 @@ fun App(c: Cfg) {
     var tab by remember { mutableIntStateOf(if (c.setupDone) 0 else 4) }
     val m = remember { Mon() }
     LaunchedEffect(c.ip, c.comm, c.ifx) { m.run(c) }
-    val tabs = listOf("🏠" to "Home", "📱" to "Devices", "🚦" to "Priority", "🌐" to "Router", "🔧" to "Setup")
+    val tabs = listOf("🏠" to "Home", "📱" to "Devices", "✅" to "Tasks", "📶" to "Line", "🔧" to "Setup")
     Scaffold(containerColor = MaterialTheme.colorScheme.background, bottomBar = {
         NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
             tabs.forEachIndexed { i, t ->
@@ -56,9 +53,11 @@ fun App(c: Cfg) {
             when (tab) {
                 0 -> Home(c, m) { tab = it }
                 1 -> Devices(c)
-                2 -> Priority(c)
-                3 -> Web(c)
-                else -> Setup(c) { tab = it }
+                2 -> Tasks(c) { tab = it }
+                3 -> Line(c) { tab = it }
+                4 -> Setup(c) { tab = it }
+                5 -> Priority(c)
+                else -> Web(c)
             }
         }
     }
